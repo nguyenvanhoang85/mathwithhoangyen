@@ -1,17 +1,17 @@
 {
   "name": "math-with-hoangyen",
   "version": "1.0.0",
-  "description": "Nen tang hoc toan thong minh Math with HoangYen",
+  "description": "Nen tang hoc Toan Online Math with HoangYen",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.0",
     "express": "^4.21.2",
     "express-session": "^1.18.1",
     "json2csv": "^6.0.0-alpha.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "sqlite3": "^5.1.7"
   },
   "engines": {
     "node": ">=18.0.0"
