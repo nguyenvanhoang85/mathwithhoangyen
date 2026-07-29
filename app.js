@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const initSqlJs = require('sql.js');
 const multer = require('multer');
 const session = require('express-session');
 const path = require('path');
@@ -7,11 +7,9 @@ const fs = require('fs');
 const { Parser } = require('json2csv');
 
 const app = express();
-
-// Cấu hình Cổng PORT linh hoạt cho Render
 const PORT = process.env.PORT || 3000;
 
-// Thư mục lưu file PDF
+// Cấu hình thư mục lưu file PDF
 const uploadDir = process.env.RENDER ? path.join('/tmp', 'uploads') : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -48,11 +46,27 @@ function requireAdmin(req, res, next) {
   res.status(403).send('Từ chối truy cập: Bắt buộc quyền Admin / Giáo viên!');
 }
 
-// Khởi tạo Cơ sở dữ liệu SQLite3
+// Khởi tạo Database với sql.js (JavaScript/WASM thuần - Không bao giờ lỗi Build)
+let db;
 const dbPath = process.env.RENDER ? path.join('/tmp', 'math_hoangyen.db') : path.join(__dirname, 'math_hoangyen.db');
-const db = new sqlite3.Database(dbPath);
 
-db.serialize(() => {
+function saveDatabase() {
+  if (db) {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(dbPath, buffer);
+  }
+}
+
+async function initDB() {
+  const SQL = await initSqlJs();
+  if (fs.existsSync(dbPath)) {
+    const filebuffer = fs.readFileSync(dbPath);
+    db = new SQL.Database(filebuffer);
+  } else {
+    db = new SQL.Database();
+  }
+
   db.run(`
     CREATE TABLE IF NOT EXISTS math_lessons (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +76,7 @@ db.serialize(() => {
       topic TEXT,
       pdf_path TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
+    );
   `);
 
   db.run(`
@@ -74,9 +88,8 @@ db.serialize(() => {
       option_b TEXT NOT NULL,
       option_c TEXT NOT NULL,
       option_d TEXT NOT NULL,
-      correct_option TEXT NOT NULL,
-      FOREIGN KEY(lesson_id) REFERENCES math_lessons(id) ON DELETE CASCADE
-    )
+      correct_option TEXT NOT NULL
+    );
   `);
 
   db.run(`
@@ -87,21 +100,36 @@ db.serialize(() => {
       score INTEGER,
       status TEXT,
       completed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
+    );
   `);
 
-  db.get('SELECT COUNT(*) as count FROM math_lessons', (err, row) => {
-    if (!err && row && row.count === 0) {
-      const stmt = db.prepare('INSERT INTO math_lessons (code, title, level, topic) VALUES (?, ?, ?, ?)');
-      stmt.run('MATH-C1-01', 'Bảng cửu chương & Phép tính cơ bản', 'Cấp 1 (Tiểu học)', 'Số học');
-      stmt.run('MATH-C2-01', 'Phương trình bậc nhất một ẩn', 'Cấp 2 (THCS)', 'Đại số');
-      stmt.run('MATH-C3-01', 'Đạo hàm & Ứng dụng trong Hình học', 'Cấp 3 (THPT)', 'Giải tích');
-      stmt.finalize();
-    }
-  });
-});
+  const res = db.exec('SELECT COUNT(*) as count FROM math_lessons');
+  const count = res.length > 0 ? res[0].values[0][0] : 0;
 
-// Trang Đăng nhập
+  if (count === 0) {
+    db.run('INSERT INTO math_lessons (code, title, level, topic) VALUES (?, ?, ?, ?)', ['MATH-C1-01', 'Bảng cửu chương & Phép tính cơ bản', 'Cấp 1 (Tiểu học)', 'Số học']);
+    db.run('INSERT INTO math_lessons (code, title, level, topic) VALUES (?, ?, ?, ?)', ['MATH-C2-01', 'Phương trình bậc nhất một ẩn', 'Cấp 2 (THCS)', 'Đại số']);
+    db.run('INSERT INTO math_lessons (code, title, level, topic) VALUES (?, ?, ?, ?)', ['MATH-C3-01', 'Đạo hàm & Ứng dụng trong Hình học', 'Cấp 3 (THPT)', 'Giải tích']);
+    saveDatabase();
+  }
+}
+
+initDB();
+
+// Helper chuyển query kết quả sql.js về mảng Object chuẩn
+function parseResult(res) {
+  if (!res || res.length === 0) return [];
+  const columns = res[0].columns;
+  return res[0].values.map(row => {
+    const obj = {};
+    columns.forEach((col, idx) => {
+      obj[col] = row[idx];
+    });
+    return obj;
+  });
+}
+
+// Routes
 app.get('/login', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -168,99 +196,100 @@ app.get('/logout', (req, res) => {
 // APIs
 app.get('/api/lessons', requireLogin, (req, res) => {
   const level = req.query.level || '';
+  let stmt;
   if (level) {
-    db.all('SELECT * FROM math_lessons WHERE level = ? ORDER BY id DESC', [level], (err, rows) => {
-      res.json(rows || []);
-    });
+    stmt = db.exec('SELECT * FROM math_lessons WHERE level = ? ORDER BY id DESC', [level]);
   } else {
-    db.all('SELECT * FROM math_lessons ORDER BY id DESC', (err, rows) => {
-      res.json(rows || []);
-    });
+    stmt = db.exec('SELECT * FROM math_lessons ORDER BY id DESC');
   }
+  res.json(parseResult(stmt));
 });
 
 app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), (req, res) => {
   const { code, title, level, topic } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
 
-  const stmt = db.prepare('INSERT INTO math_lessons (code, title, level, topic, pdf_path) VALUES (?, ?, ?, ?, ?)');
-  stmt.run(code, title, level, topic, pdfPath, (err) => {
-    if (err) {
-      return res.status(400).send('Lỗi: Mã bài học đã tồn tại! <a href="/">Quay lại</a>');
-    }
+  try {
+    db.run('INSERT INTO math_lessons (code, title, level, topic, pdf_path) VALUES (?, ?, ?, ?, ?)', [code, title, level, topic, pdfPath]);
+    saveDatabase();
     res.redirect('/');
-  });
+  } catch (err) {
+    res.status(400).send('Lỗi: Mã bài học đã tồn tại! <a href="/">Quay lại</a>');
+  }
 });
 
 app.delete('/api/lessons/:id', requireLogin, requireAdmin, (req, res) => {
-  db.get('SELECT pdf_path FROM math_lessons WHERE id = ?', [req.params.id], (err, lesson) => {
-    if (lesson && lesson.pdf_path) {
-      const fullPath = path.join(uploadDir, path.basename(lesson.pdf_path));
-      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
-    }
-    db.run('DELETE FROM math_lessons WHERE id = ?', [req.params.id]);
-    db.run('DELETE FROM math_quizzes WHERE lesson_id = ?', [req.params.id]);
-    res.json({ success: true });
-  });
+  const result = parseResult(db.exec('SELECT pdf_path FROM math_lessons WHERE id = ?', [req.params.id]));
+  if (result.length > 0 && result[0].pdf_path) {
+    const fullPath = path.join(uploadDir, path.basename(result[0].pdf_path));
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+  }
+  db.run('DELETE FROM math_lessons WHERE id = ?', [req.params.id]);
+  db.run('DELETE FROM math_quizzes WHERE lesson_id = ?', [req.params.id]);
+  saveDatabase();
+  res.json({ success: true });
 });
 
 app.get('/api/lessons/:id/quizzes', requireLogin, (req, res) => {
-  db.all('SELECT id, question, option_a, option_b, option_c, option_d FROM math_quizzes WHERE lesson_id = ?', [req.params.id], (err, rows) => {
-    res.json(rows || []);
-  });
+  const quizzes = parseResult(db.exec('SELECT id, question, option_a, option_b, option_c, option_d FROM math_quizzes WHERE lesson_id = ?', [req.params.id]));
+  res.json(quizzes);
 });
 
 app.post('/api/quizzes', requireLogin, requireAdmin, (req, res) => {
   const { lesson_id, question, option_a, option_b, option_c, option_d, correct_option } = req.body;
-  const stmt = db.prepare(`
+  db.run(`
     INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(lesson_id, question, option_a, option_b, option_c, option_d, correct_option, () => {
-    res.redirect('/');
-  });
+  `, [lesson_id, question, option_a, option_b, option_c, option_d, correct_option]);
+  saveDatabase();
+  res.redirect('/');
 });
 
 app.post('/api/submit-quiz', requireLogin, (req, res) => {
   const { lesson_id, answers } = req.body;
-  db.all('SELECT id, correct_option FROM math_quizzes WHERE lesson_id = ?', [lesson_id], (err, quizzes) => {
-    if (!quizzes || quizzes.length === 0) {
-      return res.json({ score: 100, status: 'Đã học xong lý thuyết' });
+  const quizzes = parseResult(db.exec('SELECT id, correct_option FROM math_quizzes WHERE lesson_id = ?', [lesson_id]));
+
+  if (quizzes.length === 0) {
+    return res.json({ score: 100, status: 'Đã học xong lý thuyết' });
+  }
+
+  let correctCount = 0;
+  quizzes.forEach(q => {
+    if (answers && answers[q.id] === q.correct_option) {
+      correctCount++;
     }
-
-    let correctCount = 0;
-    quizzes.forEach(q => {
-      if (answers && answers[q.id] === q.correct_option) {
-        correctCount++;
-      }
-    });
-
-    const score = Math.round((correctCount / quizzes.length) * 100);
-    const status = score >= 80 ? 'XUẤT SẮC' : (score >= 50 ? 'ĐẠT' : 'CẦN ÔN LẠI');
-
-    const stmt = db.prepare('INSERT INTO math_results (username, lesson_id, score, status) VALUES (?, ?, ?, ?)');
-    stmt.run(req.session.user.username, lesson_id, score, status, () => {
-      res.json({ score, status, correctCount, total: quizzes.length });
-    });
   });
+
+  const score = Math.round((correctCount / quizzes.length) * 100);
+  const status = score >= 80 ? 'XUẤT SẮC' : (score >= 50 ? 'ĐẠT' : 'CẦN ÔN LẠI');
+
+  db.run('INSERT INTO math_results (username, lesson_id, score, status) VALUES (?, ?, ?, ?)', [
+    req.session.user.username,
+    lesson_id,
+    score,
+    status
+  ]);
+  saveDatabase();
+
+  res.json({ score, status, correctCount, total: quizzes.length });
 });
 
 app.get('/api/export-results', requireLogin, (req, res) => {
-  db.all(`
+  const results = parseResult(db.exec(`
     SELECT r.id, r.username, l.title as lesson_name, l.level, r.score, r.status, r.completed_at 
     FROM math_results r 
     JOIN math_lessons l ON r.lesson_id = l.id
-  `, (err, results) => {
-    const json2csvParser = new Parser({ fields: ['id', 'username', 'lesson_name', 'level', 'score', 'status', 'completed_at'] });
-    const csv = json2csvParser.parse(results || []);
+  `));
 
-    res.header('Content-Type', 'text/csv');
-    res.attachment(`BangDiem_Math_${Date.now()}.csv`);
-    res.send(csv);
-  });
+  const json2csvParser = new Parser({ fields: ['id', 'username', 'lesson_name', 'level', 'score', 'status', 'completed_at'] });
+  const csv = json2csvParser.parse(results);
+
+  res.header('Content-Type', 'text/csv');
+  res.attachment(`BangDiem_Math_${Date.now()}.csv`);
+  res.send(csv);
 });
 
-// Trang chính
+// Trang chủ
 app.get('/', requireLogin, (req, res) => {
   const user = req.session.user;
   res.send(`
@@ -410,7 +439,6 @@ app.get('/', requireLogin, (req, res) => {
   `);
 });
 
-// Khởi chạy Server trên 0.0.0.0
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server đang chạy tại cổng: ${PORT}`);
 });
