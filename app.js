@@ -46,7 +46,7 @@ function requireAdmin(req, res, next) {
   res.status(403).send('Từ chối truy cập: Bắt buộc quyền Admin / Giáo viên!');
 }
 
-// Khởi tạo Database với sql.js (JavaScript/WASM thuần - Không bao giờ lỗi Build)
+// Khởi tạo Database với sql.js (JavaScript thuần - Không bao giờ lỗi Build)
 let db;
 const dbPath = process.env.RENDER ? path.join('/tmp', 'math_hoangyen.db') : path.join(__dirname, 'math_hoangyen.db');
 
@@ -116,7 +116,6 @@ async function initDB() {
 
 initDB();
 
-// Helper chuyển query kết quả sql.js về mảng Object chuẩn
 function parseResult(res) {
   if (!res || res.length === 0) return [];
   const columns = res[0].columns;
