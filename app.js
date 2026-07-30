@@ -4,12 +4,16 @@ const multer = require('multer');
 const session = require('express-session');
 const path = require('path');
 const fs = require('fs');
-const { Parser } = require('json2csv');
+const pdfParse = require('pdf-parse'); // Thư viện đọc text từ PDF
+const { GoogleGenAI } = require('@google/genai'); // Google GenAI SDK chính thức
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cấu hình thư mục upload (Tương thích với bộ nhớ tạm Render /tmp)
+// Khởi tạo Gemini AI Client (Sử dụng API Key từ hằng số môi trường)
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+
+// Cấu hình thư mục upload (Tương thích bộ nhớ tạm /tmp trên Render)
 const uploadDir = process.env.RENDER ? path.join('/tmp', 'uploads') : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -46,7 +50,6 @@ function requireAdmin(req, res, next) {
   res.status(403).send('Từ chối truy cập: Quyền Hạn Bắt Buộc là Admin/Giáo viên!');
 }
 
-// Khởi tạo Database SQLite
 let db;
 const dbPath = process.env.RENDER ? path.join('/tmp', 'math_hoangyen.db') : path.join(__dirname, 'math_hoangyen.db');
 
@@ -54,8 +57,7 @@ function saveDatabase() {
   if (db) {
     try {
       const data = db.export();
-      const buffer = Buffer.from(data);
-      fs.writeFileSync(dbPath, buffer);
+      fs.writeFileSync(dbPath, Buffer.from(data));
     } catch (err) {
       console.error('Lỗi lưu Database:', err);
     }
@@ -79,19 +81,15 @@ async function initDB() {
       locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `https://sql.js.org/dist/${file}`
     });
 
-    if (fs.existsSync(dbPath)) {
-      db = new SQL.Database(fs.readFileSync(dbPath));
-    } else {
-      db = new SQL.Database();
-    }
+    db = fs.existsSync(dbPath) ? new SQL.Database(fs.readFileSync(dbPath)) : new SQL.Database();
 
     db.run(`
       CREATE TABLE IF NOT EXISTS math_lessons (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT UNIQUE NOT NULL,
         title TEXT NOT NULL,
-        level TEXT NOT NULL,       -- Ví dụ: Cấp 1, Cấp 2, Cấp 3
-        grade_class TEXT NOT NULL, -- Ví dụ: Lớp 1 ... Lớp 12
+        level TEXT NOT NULL,
+        grade_class TEXT NOT NULL,
         topic TEXT,
         description TEXT,
         pdf_path TEXT,
@@ -124,30 +122,14 @@ async function initDB() {
       );
     `);
 
-    // Dữ liệu khởi tạo mẫu nếu cơ sở dữ liệu trống
-    const res = db.exec('SELECT COUNT(*) as count FROM math_lessons');
-    if (res.length === 0 || res[0].values[0][0] === 0) {
-      db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description) VALUES (?, ?, ?, ?, ?, ?)', 
-        ['MATH-L1-01', 'Phép Cộng Trong Phạm Vi 10', 'Cấp 1 (Tiểu học)', 'Lớp 1', 'Số Học', 'Các bài toán cộng đếm dành cho học sinh Lớp 1.']);
-
-      db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description) VALUES (?, ?, ?, ?, ?, ?)', 
-        ['MATH-L6-01', 'Tập Hợp & Phần Tử Của Tập Hợp', 'Cấp 2 (THCS)', 'Lớp 6', 'Đại Số', 'Chuyên đề mở đầu chương trình Toán Lớp 6.']);
-
-      db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description) VALUES (?, ?, ?, ?, ?, ?)', 
-        ['MATH-L12-01', 'Tính Đơn Điệu Của Hàm Số', 'Cấp 3 (THPT)', 'Lớp 12', 'Giải Tích', 'Chuyên đề trọng tâm ôn thi Tốt nghiệp THPT Lớp 12.']);
-
-      db.run(`INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation) VALUES 
-        (1, 'Kết quả của phép tính 3 + 5 là:', '7', '8', '9', '6', 'B', '3 cộng 5 bằng 8.')`);
-
-      saveDatabase();
-    }
-    console.log('✅ Cơ sở dữ liệu và Danh mục Lớp học đã khởi tạo xong!');
+    saveDatabase();
+    console.log('✅ Cơ sở dữ liệu SQLite đã sẵn sàng!');
   } catch (err) {
     console.error('❌ Lỗi khởi tạo DB:', err);
   }
 }
 
-// ----------------- CÁC API HỆ THỐNG ----------------- //
+// ----------------- ROUTES ----------------- //
 
 app.get('/login', (req, res) => {
   res.send(`
@@ -157,34 +139,22 @@ app.get('/login', (req, res) => {
       <meta charset="UTF-8">
       <title>Đăng Nhập - Math HoangYen</title>
       <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e0f2fe; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 100%; max-width: 380px; border-top: 5px solid #0284c7; }
-        h2 { text-align: center; color: #0284c7; margin-top: 0; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; font-weight: 600; margin-bottom: 5px; font-size: 13px; color: #334155; }
-        input { width: 100%; padding: 10px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; }
+        body { font-family: sans-serif; background: #e0f2fe; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: white; padding: 30px; border-radius: 12px; width: 100%; max-width: 380px; border-top: 5px solid #0284c7; }
+        h2 { text-align: center; color: #0284c7; margin-top:0; }
+        input { width: 100%; padding: 10px; margin: 8px 0 15px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
         button { width: 100%; background: #0284c7; color: white; padding: 11px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
-        .info { background: #f0f9ff; padding: 12px; border-radius: 6px; font-size: 13px; color: #0369a1; margin-bottom: 18px; border-left: 4px solid #0284c7; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h2>📐 Math HoangYen</h2>
-        <div class="info">
-          🔑 <b>Tài khoản hệ thống:</b><br>
-          • Giáo viên: <b>admin</b> / <b>123456</b><br>
-          • Học sinh: <b>hocsinh</b> / <b>123456</b>
-        </div>
+        <h2>📐 Đăng Nhập Hệ Thống</h2>
         <form action="/login" method="POST">
-          <div class="form-group">
-            <label>Tên đăng nhập:</label>
-            <input type="text" name="username" required placeholder="admin hoặc hocsinh">
-          </div>
-          <div class="form-group">
-            <label>Mật khẩu:</label>
-            <input type="password" name="password" required placeholder="••••••">
-          </div>
-          <button type="submit">Đăng Nhập Vào Hệ Thống</button>
+          <label>Tên đăng nhập:</label>
+          <input type="text" name="username" required placeholder="admin hoặc hocsinh">
+          <label>Mật khẩu:</label>
+          <input type="password" name="password" required placeholder="123456">
+          <button type="submit">Vào Hệ Thống</button>
         </form>
       </div>
     </body>
@@ -201,7 +171,7 @@ app.post('/login', (req, res) => {
     req.session.user = { username: 'hocsinh', role: 'Student' };
     res.redirect('/');
   } else {
-    res.send('<script>alert("Sai tên đăng nhập hoặc mật khẩu!"); window.location.href="/login";</script>');
+    res.send('<script>alert("Sai tài khoản hoặc mật khẩu!"); window.location.href="/login";</script>');
   }
 });
 
@@ -210,37 +180,86 @@ app.get('/logout', (req, res) => {
   res.redirect('/login');
 });
 
-// API Lấy danh sách Bài học lọc theo Cấp hoặc theo Lớp
+// API Lấy danh sách Bài học
 app.get('/api/lessons', requireLogin, (req, res) => {
   if (!db) return res.json([]);
-  const { level, grade_class } = req.query;
+  const { grade_class } = req.query;
   let sql = 'SELECT * FROM math_lessons WHERE 1=1';
   const params = [];
-
-  if (level) {
-    sql += ' AND level = ?';
-    params.push(level);
-  }
   if (grade_class) {
     sql += ' AND grade_class = ?';
     params.push(grade_class);
   }
-
   sql += ' ORDER BY id DESC';
   res.json(parseResult(db.exec(sql, params)));
 });
 
-// API Thêm bài học mới
-app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), (req, res) => {
-  const { code, title, level, grade_class, topic, description } = req.body;
+// API Thêm Bài học mới + Tự tạo bài tập bằng AI
+app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async (req, res) => {
+  const { code, title, level, grade_class, topic, description, auto_gen_quiz } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
+  
   try {
     db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description, pdf_path) VALUES (?, ?, ?, ?, ?, ?, ?)', 
       [code, title, level, grade_class, topic, description || '', pdfPath]);
+    
+    // Lấy ID bài học vừa lưu
+    const lastIdRes = db.exec('SELECT last_insert_rowid() as id');
+    const lessonId = lastIdRes[0].values[0][0];
+
+    // NẾU TÍCH CHỌN TỰ ĐỘNG TẠO BÀI TẬP VÀ CÓ FILE PDF
+    if (auto_gen_quiz === 'on' && req.file) {
+      const fullPath = path.join(uploadDir, req.file.filename);
+      const dataBuffer = fs.readFileSync(fullPath);
+      
+      // 1. Đọc nội dung văn bản từ PDF
+      const pdfData = await pdfParse(dataBuffer);
+      const textContent = pdfData.text.slice(0, 4000); // Giới hạn ký tự tối ưu hóa tốc độ AI
+
+      if (textContent.trim().length > 50) {
+        // 2. Tạo prompt yêu cầu Gemini sinh trắc nghiệm
+        const prompt = `Bạn là chuyên gia soạn đề thi Toán học Việt Nam. Dựa vào nội dung tài liệu toán sau đây:
+---
+${textContent}
+---
+Hãy tạo 3 câu hỏi trắc nghiệm khách quan phù hợp cho trình độ ${grade_class}. 
+Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm văn bản giải thích ngoài JSON, theo cấu trúc chính xác sau:
+[
+  {
+    "question": "Nội dung câu hỏi?",
+    "option_a": "Lựa chọn A",
+    "option_b": "Lựa chọn B",
+    "option_c": "Lựa chọn C",
+    "option_d": "Lựa chọn D",
+    "correct_option": "A",
+    "explanation": "Giải thích chi tiết ngắn gọn"
+  }
+]`;
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+
+        // Xử lý chuỗi JSON kết quả trả về từ Gemini
+        const rawText = response.text.replace(/```json|```/g, '').trim();
+        const quizList = JSON.parse(rawText);
+
+        // 3. Lưu các câu hỏi trắc nghiệm tự động vào Database
+        quizList.forEach(q => {
+          db.run(`
+            INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `, [lessonId, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, q.explanation || '']);
+        });
+      }
+    }
+
     saveDatabase();
     res.redirect('/#lessons');
   } catch (err) {
-    res.status(400).send('Lỗi: Mã Bài Học này đã tồn tại! <a href="/">Quay lại</a>');
+    console.error('Lỗi thêm bài học hoặc lỗi sinh câu hỏi AI:', err);
+    res.status(500).send('Lỗi trong quá trình xử lý! <a href="/">Quay lại trang chủ</a>');
   }
 });
 
@@ -252,7 +271,7 @@ app.delete('/api/lessons/:id', requireLogin, requireAdmin, (req, res) => {
   res.json({ success: true });
 });
 
-// API Quản lý Bài tập Trắc nghiệm
+// API Lấy danh sách bài tập trắc nghiệm
 app.get('/api/quizzes', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   const lesson_id = req.query.lesson_id;
@@ -260,16 +279,7 @@ app.get('/api/quizzes', requireLogin, (req, res) => {
   res.json(parseResult(stmt));
 });
 
-app.post('/api/quizzes', requireLogin, requireAdmin, (req, res) => {
-  const { lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation } = req.body;
-  db.run(`
-    INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `, [lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation || '']);
-  saveDatabase();
-  res.redirect('/#exercises');
-});
-
+// API Nộp bài làm trắc nghiệm
 app.post('/api/submit-quiz', requireLogin, (req, res) => {
   const { lesson_id, answers } = req.body;
   const quizzes = parseResult(db.exec('SELECT id, correct_option FROM math_quizzes WHERE lesson_id = ?', [lesson_id]));
@@ -292,7 +302,7 @@ app.post('/api/submit-quiz', requireLogin, (req, res) => {
   res.json({ score, status, correctCount, total: quizzes.length });
 });
 
-// API Xem Bảng điểm
+// API Lấy kết quả làm bài
 app.get('/api/results', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   let sql = `
@@ -307,8 +317,7 @@ app.get('/api/results', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql)));
 });
 
-// ----------------- GIAO DIỆN HỆ THỐNG PHÂN MỤC VÀ CẤP LỚP ----------------- //
-
+// Giao diện chính
 app.get('/', requireLogin, (req, res) => {
   const user = req.session.user;
   res.send(`
@@ -317,79 +326,57 @@ app.get('/', requireLogin, (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Hệ Thống Toán Học Phân Loại Theo Lớp</title>
+      <title>Math HoangYen - Hệ Thống Bài Giảng & Bài Tập AI</title>
       <style>
-        :root { --primary: #0284c7; --primary-dark: #0369a1; --bg: #f8fafc; }
+        :root { --primary: #0284c7; --bg: #f8fafc; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: var(--bg); color: #0f172a; }
-        
-        header { background: var(--primary); color: white; padding: 0 20px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .logo { font-size: 20px; font-weight: bold; }
-        .user-box { font-size: 14px; }
-        .user-box a { color: #e0f2fe; text-decoration: none; font-weight: bold; margin-left: 10px; }
-
+        header { background: var(--primary); color: white; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center; }
         .nav-tabs { background: white; border-bottom: 1px solid #e2e8f0; display: flex; padding: 0 20px; gap: 10px; }
         .tab-btn { padding: 14px 20px; border: none; background: none; font-size: 15px; font-weight: 600; color: #64748b; cursor: pointer; border-bottom: 3px solid transparent; }
-        .tab-btn:hover { color: var(--primary); }
         .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
-
         .container { max-width: 1200px; margin: 25px auto; padding: 0 20px; }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
-
         .card { background: white; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 2px 4px rgba(0,0,0,0.02); margin-bottom: 20px; }
         .btn { background: var(--primary); color: white; border: none; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        .btn:hover { background: var(--primary-dark); }
         .btn-danger { background: #dc2626; }
-        
         input, select, textarea { width: 100%; padding: 9px; margin-top: 5px; margin-bottom: 12px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
-        
-        .grid-2 { display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
+        .grid-2 { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
         .lesson-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 18px; }
         .lesson-card { background: white; border: 1px solid #e2e8f0; border-top: 4px solid var(--primary); padding: 18px; border-radius: 8px; }
-
-        /* Style danh mục Lớp học */
-        .filter-group { margin-bottom: 15px; }
-        .grade-badge { display: inline-block; padding: 6px 12px; background: #e0f2fe; color: #0369a1; border-radius: 20px; font-size: 13px; font-weight: bold; margin-right: 5px; margin-bottom: 8px; cursor: pointer; border: 1px solid #bae6fd; }
-        .grade-badge:hover, .grade-badge.active { background: var(--primary); color: white; }
-
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; }
-        th { background: #f1f5f9; color: #475569; }
-        iframe { width: 100%; height: 500px; border: 1px solid #cbd5e1; border-radius: 6px; margin-top: 15px; }
+        .grade-badge { display: inline-block; padding: 6px 12px; background: #e0f2fe; color: #0369a1; border-radius: 20px; font-size: 13px; font-weight: bold; margin-right: 5px; margin-bottom: 8px; cursor: pointer; }
+        .grade-badge.active { background: var(--primary); color: white; }
+        .ai-box { background: #f0fdf4; border: 1px solid #bbf7d0; padding: 12px; border-radius: 6px; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
+        iframe { width: 100%; height: 500px; border: 1px solid #cbd5e1; border-radius: 6px; }
       </style>
     </head>
     <body>
-
       <header>
-        <div class="logo">📐 Math HoangYen - Hệ Thống Bài Giảng Theo Lớp</div>
-        <div class="user-box">
-          👤 <b>${user.username}</b> (${user.role}) | 
-          <a href="/logout">Đăng xuất</a>
-        </div>
+        <div style="font-size:18px; font-weight:bold;">📐 Math HoangYen - Tự Động Sinh Bài Tập AI</div>
+        <div>👤 ${user.username} (${user.role}) | <a href="/logout" style="color:white; font-weight:bold;">Đăng xuất</a></div>
       </header>
 
-      <!-- TABS CHÍNH -->
       <div class="nav-tabs">
-        <button class="tab-btn active" onclick="switchTab('lessons', this)">📚 Mục 1: Thư Viện Tài Liệu Theo Lớp</button>
-        <button class="tab-btn" onclick="switchTab('exercises', this)">📝 Mục 2: Ngân Hàng Bài Tập Trắc Nghiệm</button>
-        <button class="tab-btn" onclick="switchTab('results', this)">📊 Mục 3: Kết Quả & Bảng Điểm</button>
+        <button class="tab-btn active" onclick="switchTab('lessons', this)">📚 Mục 1: Danh Mục Bài Giảng</button>
+        <button class="tab-btn" onclick="switchTab('exercises', this)">📝 Mục 2: Ngân Hàng Bài Tập AI</button>
+        <button class="tab-btn" onclick="switchTab('results', this)">📊 Mục 3: Bảng Điểm Học Sinh</button>
       </div>
 
       <div class="container">
-
-        <!-- ================= MỤC 1: TÀI LIỆU CÁC LỚP ================= -->
+        <!-- TAB 1: BÀI GIẢNG -->
         <div id="tab-lessons" class="tab-content active">
           <div class="${user.role === 'Admin' ? 'grid-2' : ''}">
-            
             ${user.role === 'Admin' ? `
             <div class="card">
               <h3>📂 Thêm Bài Học Mới</h3>
               <form action="/api/lessons" method="POST" enctype="multipart/form-data">
                 <label>Mã bài học:</label>
-                <input type="text" name="code" placeholder="VD: MATH-L6-02" required>
+                <input type="text" name="code" placeholder="VD: MATH-L10-01" required>
                 
                 <label>Tên bài học:</label>
-                <input type="text" name="title" placeholder="VD: Phép Chia Hết & Phép Chia Có Dư" required>
+                <input type="text" name="title" required placeholder="VD: Phép Tích Vô Hướng">
                 
                 <label>Khối Cấp Học:</label>
                 <select name="level" id="formLevel" onchange="updateGradeDropdown(this.value)">
@@ -398,171 +385,95 @@ app.get('/', requireLogin, (req, res) => {
                   <option value="Cấp 3 (THPT)">Cấp 3 (THPT)</option>
                 </select>
 
-                <label>Chọn Lớp Học Cụ Thể:</label>
-                <select name="grade_class" id="formGrade">
-                  <!-- JS sẽ điền danh sách lớp dựa trên Cấp học -->
-                </select>
+                <label>Lớp Học Cụ Thể:</label>
+                <select name="grade_class" id="formGrade"></select>
 
                 <label>Chuyên đề Toán:</label>
-                <input type="text" name="topic" placeholder="VD: Đại số, Hình học...">
+                <input type="text" name="topic" placeholder="Đại số / Hình học">
 
-                <label>Tệp PDF Bài Giảng:</label>
+                <label>Tệp Bài Giảng (PDF):</label>
                 <input type="file" name="pdf" accept="application/pdf">
 
-                <label>Mô tả ngắn:</label>
-                <textarea name="description" rows="2"></textarea>
+                <div class="ai-box">
+                  <label style="font-weight:bold; color:#15803d; cursor:pointer;">
+                    <input type="checkbox" name="auto_gen_quiz" value="on" checked style="width:auto; margin-right:5px;">
+                    ✨ Tự động phân tích PDF & sinh câu hỏi trắc nghiệm!
+                  </label>
+                </div>
 
-                <button type="submit" class="btn" style="width: 100%;">Tải Bài Học Lên</button>
+                <button type="submit" class="btn" style="width: 100%;">Thêm Bài Học Mới</button>
               </form>
             </div>
             ` : ''}
 
             <div>
               <div class="card">
-                <h3>🏷️ Phân Loại Danh Mục Theo Lớp Học</h3>
-                
-                <div class="filter-group">
-                  <span class="grade-badge active" onclick="filterByGrade('', this)">Tất Cả Lớp</span>
-                </div>
-
-                <div class="filter-group">
-                  <b>• Cấp 1 (Tiểu Học):</b><br>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 1', this)">Lớp 1</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 2', this)">Lớp 2</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 3', this)">Lớp 3</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 4', this)">Lớp 4</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 5', this)">Lớp 5</span>
-                </div>
-
-                <div class="filter-group">
-                  <b>• Cấp 2 (THCS):</b><br>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 6', this)">Lớp 6</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 7', this)">Lớp 7</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 8', this)">Lớp 8</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 9', this)">Lớp 9</span>
-                </div>
-
-                <div class="filter-group">
-                  <b>• Cấp 3 (THPT):</b><br>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 10', this)">Lớp 10</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 11', this)">Lớp 11</span>
-                  <span class="grade-badge" onclick="filterByGrade('Lớp 12', this)">Lớp 12</span>
-                </div>
-
-                <hr style="border:none; border-top: 1px solid #e2e8f0; margin: 15px 0;">
-                
+                <h3>🏷️ Chọn Xem Lớp Học</h3>
+                <span class="grade-badge active" onclick="filterByGrade('', this)">Tất Cả Lớp</span>
+                <span class="grade-badge" onclick="filterByGrade('Lớp 1', this)">Lớp 1</span>
+                <span class="grade-badge" onclick="filterByGrade('Lớp 6', this)">Lớp 6</span>
+                <span class="grade-badge" onclick="filterByGrade('Lớp 10', this)">Lớp 10</span>
+                <span class="grade-badge" onclick="filterByGrade('Lớp 12', this)">Lớp 12</span>
+                <hr style="border:none; border-top:1px solid #e2e8f0; margin:15px 0;">
                 <div class="lesson-grid" id="lessonGrid"></div>
               </div>
 
-              <!-- Trình xem PDF -->
               <div class="card" id="pdfViewerCard" style="display:none;">
                 <h3 id="pdfTitle">Nội dung bài học</h3>
                 <iframe id="pdfFrame" src="about:blank"></iframe>
               </div>
             </div>
-
           </div>
         </div>
 
-        <!-- ================= MỤC 2: BÀI TẬP TRẮC NGHIỆM ================= -->
+        <!-- TAB 2: BÀI TẬP TRẮC NGHIỆM -->
         <div id="tab-exercises" class="tab-content">
-          <div class="${user.role === 'Admin' ? 'grid-2' : ''}">
-            ${user.role === 'Admin' ? `
-            <div class="card">
-              <h3>➕ Tạo Câu Hỏi Mới</h3>
-              <form action="/api/quizzes" method="POST">
-                <label>Thuộc Bài Học Của Lớp:</label>
-                <select name="lesson_id" id="quizLessonSelect" required></select>
+          <div class="card">
+            <h3>📝 Bài Tập Trắc Nghiệm Tự Động</h3>
+            <label>Chọn Bài Học Cần Luyện Tập:</label>
+            <select id="doExerciseSelect" onchange="loadQuizForStudent(this.value)">
+              <option value="">-- Chọn bài học --</option>
+            </select>
 
-                <label>Câu hỏi:</label>
-                <textarea name="question" rows="3" required placeholder="Nhập nội dung câu hỏi..."></textarea>
-
-                <label>Đáp án A:</label> <input type="text" name="option_a" required>
-                <label>Đáp án B:</label> <input type="text" name="option_b" required>
-                <label>Đáp án C:</label> <input type="text" name="option_c" required>
-                <label>Đáp án D:</label> <input type="text" name="option_d" required>
-
-                <label>Đáp Án Đúng:</label>
-                <select name="correct_option">
-                  <option value="A">Khung A</option>
-                  <option value="B">Khung B</option>
-                  <option value="C">Khung C</option>
-                  <option value="D">Khung D</option>
-                </select>
-
-                <label>Lời giải chi tiết:</label>
-                <textarea name="explanation" rows="2"></textarea>
-
-                <button type="submit" class="btn" style="width:100%; background:#16a34a;">Lưu Câu Hỏi</button>
-              </form>
-            </div>
-            ` : ''}
-
-            <div>
-              <div class="card">
-                <h3>📝 Danh Sách Bài Tập Theo Lớp</h3>
-                <label>Lựa Chọn Bài Học Để Luyện Tập:</label>
-                <select id="doExerciseSelect" onchange="loadQuizForStudent(this.value)">
-                  <option value="">-- Chọn bài học --</option>
-                </select>
-
-                <div id="quizDoingArea" style="margin-top: 20px; display:none;">
-                  <form id="studentQuizForm"></form>
-                  <button class="btn" onclick="submitStudentQuiz()" style="margin-top: 15px; background:#16a34a;">Nộp Bài Làm</button>
-                  <div id="quizResultNotify" style="margin-top:15px; font-weight:bold; font-size:16px;"></div>
-                </div>
-              </div>
+            <div id="quizDoingArea" style="margin-top: 20px; display:none;">
+              <form id="studentQuizForm"></form>
+              <button class="btn" onclick="submitStudentQuiz()" style="margin-top: 15px; background:#16a34a;">Nộp Bài Làm</button>
+              <div id="quizResultNotify" style="margin-top:15px; font-weight:bold;"></div>
             </div>
           </div>
         </div>
 
-        <!-- ================= MỤC 3: BẢNG ĐIỂM ================= -->
+        <!-- TAB 3: BẢNG ĐIỂM -->
         <div id="tab-results" class="tab-content">
           <div class="card">
-            <h3>📊 Bảng Điểm Luyện Tập Bài Tập</h3>
+            <h3>📊 Bảng Điểm Học Sinh</h3>
             <table>
               <thead>
                 <tr>
-                  <th>#</th>
-                  <th>Học Sinh</th>
-                  <th>Bài Học</th>
-                  <th>Lớp</th>
-                  <th>Điểm Số</th>
-                  <th>Đánh Giá</th>
-                  <th>Thời Gian</th>
+                  <th>#</th><th>Học Sinh</th><th>Bài Học</th><th>Lớp</th><th>Điểm Số</th><th>Đánh Giá</th>
                 </tr>
               </thead>
               <tbody id="resultsTableBody"></tbody>
             </table>
           </div>
         </div>
-
       </div>
 
       <script>
         const userRole = "${user.role}";
 
-        // Tự động điều chỉnh dropdown chọn lớp học theo cấp học
         function updateGradeDropdown(level) {
           const select = document.getElementById('formGrade');
           if(!select) return;
           select.innerHTML = '';
-          
-          let grades = [];
-          if(level === 'Cấp 1 (Tiểu học)') grades = ['Lớp 1', 'Lớp 2', 'Lớp 3', 'Lớp 4', 'Lớp 5'];
-          else if(level === 'Cấp 2 (THCS)') grades = ['Lớp 6', 'Lớp 7', 'Lớp 8', 'Lớp 9'];
-          else grades = ['Lớp 10', 'Lớp 11', 'Lớp 12'];
-
-          grades.forEach(g => {
-            select.innerHTML += \`<option value="\${g}">\${g}</option>\`;
-          });
+          let grades = level === 'Cấp 1 (Tiểu học)' ? ['Lớp 1','Lớp 2','Lớp 3','Lớp 4','Lớp 5'] :
+                       level === 'Cấp 2 (THCS)' ? ['Lớp 6','Lớp 7','Lớp 8','Lớp 9'] : ['Lớp 10','Lớp 11','Lớp 12'];
+          grades.forEach(g => { select.innerHTML += \`<option value="\${g}">\${g}</option>\`; });
         }
 
-        // Chuyển Tab
         function switchTab(tabName, btn) {
           document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
           document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-          
           document.getElementById('tab-' + tabName).classList.add('active');
           btn.classList.add('active');
 
@@ -571,27 +482,19 @@ app.get('/', requireLogin, (req, res) => {
           if(tabName === 'results') loadResults();
         }
 
-        // 1. Tải danh sách Bài giảng theo Lớp
         async function loadLessons(grade = '') {
           const res = await fetch('/api/lessons?grade_class=' + encodeURIComponent(grade));
           const lessons = await res.json();
           const grid = document.getElementById('lessonGrid');
           grid.innerHTML = '';
 
-          if(lessons.length === 0) {
-            grid.innerHTML = '<p style="color:#64748b;">Chưa có tài liệu/bài giảng nào cho lựa chọn này.</p>';
-            return;
-          }
-
           lessons.forEach(l => {
             grid.innerHTML += \`
               <div class="lesson-card">
-                <small style="color:var(--primary); font-weight:bold;">\${l.grade_class} - \${l.level}</small>
+                <small style="color:var(--primary); font-weight:bold;">\${l.grade_class}</small>
                 <h4 style="margin: 8px 0;">\${l.title}</h4>
-                <p style="font-size:13px; color:#64748b;">Chuyên đề: <b>\${l.topic || 'Chung'}</b></p>
-                <p style="font-size:13px; color:#64748b;">\${l.description || 'Chưa có mô tả'}</p>
-                <button class="btn" onclick="viewPdf('\${l.title}', '\${l.pdf_path}')">Xem Tài Liệu PDF</button>
-                \${userRole === 'Admin' ? \`<button class="btn btn-danger" onclick="deleteLesson(\${l.id})" style="margin-left:5px;">Xóa</button>\` : ''}
+                <button class="btn" onclick="viewPdf('\${l.title}', '\${l.pdf_path}')">Xem File PDF</button>
+                \${userRole === 'Admin' ? \`<button class="btn btn-danger" onclick="deleteLesson(\${l.id})">Xóa</button>\` : ''}
               </div>
             \`;
           });
@@ -604,54 +507,45 @@ app.get('/', requireLogin, (req, res) => {
         }
 
         function viewPdf(title, path) {
-          if(!path) return alert('Bài học này chưa được đính kèm file PDF!');
+          if(!path) return alert('Chưa đính kèm file PDF!');
           document.getElementById('pdfViewerCard').style.display = 'block';
-          document.getElementById('pdfTitle').innerText = '📖 ' + title;
+          document.getElementById('pdfTitle').innerText = title;
           document.getElementById('pdfFrame').src = path;
         }
 
         async function deleteLesson(id) {
-          if(confirm('Bạn có chắc chắn muốn xóa bài học này?')) {
+          if(confirm('Xóa bài học này?')) {
             await fetch('/api/lessons/' + id, { method: 'DELETE' });
             loadLessons();
           }
         }
 
-        // 2. Bài tập
         async function loadQuizOptions() {
           const res = await fetch('/api/lessons');
           const lessons = await res.json();
-          
-          const selAdmin = document.getElementById('quizLessonSelect');
           const selStudent = document.getElementById('doExerciseSelect');
-          
           let options = '<option value="">-- Chọn Bài Học --</option>';
           lessons.forEach(l => { options += \`<option value="\${l.id}">[\${l.grade_class}] \${l.title}</option>\`; });
-          
-          if(selAdmin) selAdmin.innerHTML = options;
-          if(selStudent) selStudent.innerHTML = options;
+          selStudent.innerHTML = options;
         }
 
         async function loadQuizForStudent(lessonId) {
           if(!lessonId) return;
           const res = await fetch('/api/quizzes?lesson_id=' + lessonId);
           const quizzes = await res.json();
-          
           const area = document.getElementById('quizDoingArea');
           const form = document.getElementById('studentQuizForm');
           
           if(quizzes.length === 0) {
             area.style.display = 'none';
-            alert('Bài học này chưa có câu hỏi trắc nghiệm!');
-            return;
+            return alert('Bài học này chưa có câu hỏi trắc nghiệm!');
           }
 
           area.style.display = 'block';
           form.innerHTML = '';
-          
           quizzes.forEach((q, idx) => {
             form.innerHTML += \`
-              <div style="margin-bottom: 15px; padding: 10px; background:#f8fafc; border-radius:6px;">
+              <div style="margin-bottom: 15px; padding:10px; background:#f8fafc; border-radius:6px;">
                 <p><b>Câu \${idx + 1}: \${q.question}</b></p>
                 <label><input type="radio" name="q_\${q.id}" value="A"> A. \${q.option_a}</label><br>
                 <label><input type="radio" name="q_\${q.id}" value="B"> B. \${q.option_b}</label><br>
@@ -667,7 +561,6 @@ app.get('/', requireLogin, (req, res) => {
           const form = document.getElementById('studentQuizForm');
           const formData = new FormData(form);
           const answers = {};
-
           for (let [k, v] of formData.entries()) {
             if (k.startsWith('q_')) answers[k.replace('q_', '')] = v;
           }
@@ -679,36 +572,29 @@ app.get('/', requireLogin, (req, res) => {
           });
 
           const result = await res.json();
-          document.getElementById('quizResultNotify').innerHTML = 
-            \`Kết quả: <span style="color:var(--primary)">\${result.score}/100 điểm</span> - Đánh giá: <b>\${result.status}</b> (\${result.correctCount}/\${result.total} câu)\`;
+          document.getElementById('quizResultNotify').innerHTML = \`Kết quả: \${result.score}/100 điểm - Đánh giá: \${result.status}\`;
         }
 
-        // 3. Kết quả
         async function loadResults() {
           const res = await fetch('/api/results');
           const data = await res.json();
           const tbody = document.getElementById('resultsTableBody');
           tbody.innerHTML = '';
-
           data.forEach((r, i) => {
             tbody.innerHTML += \`
               <tr>
                 <td>\${i + 1}</td>
-                <td><b>\${r.username}</b></td>
-                <td>\${r.lesson_name || 'N/A'}</td>
-                <td><span style="color:var(--primary); font-weight:bold;">\${r.grade_class || 'N/A'}</span></td>
-                <td><b>\${r.score} điểm</b></td>
+                <td>\${r.username}</td>
+                <td>\${r.lesson_name || ''}</td>
+                <td>\${r.grade_class || ''}</td>
+                <td><b>\${r.score}</b></td>
                 <td>\${r.status}</td>
-                <td>\${new Date(r.completed_at).toLocaleString('vi-VN')}</td>
               </tr>
             \`;
           });
         }
 
-        // Khởi tạo
-        if(document.getElementById('formLevel')) {
-          updateGradeDropdown(document.getElementById('formLevel').value);
-        }
+        if(document.getElementById('formLevel')) updateGradeDropdown('Cấp 2 (THCS)');
         loadLessons();
       </script>
     </body>
@@ -716,7 +602,6 @@ app.get('/', requireLogin, (req, res) => {
   `);
 });
 
-// Khởi chạy Máy chủ
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server Math HoangYen đang chạy thành công tại cổng: ${PORT}`);
