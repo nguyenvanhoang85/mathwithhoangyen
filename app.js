@@ -75,16 +75,14 @@ function parseResult(res) {
   });
 }
 
-// Hàm xử lý và bóc tách dữ liệu JSON an toàn từ AI
+// Hàm bóc tách dữ liệu JSON an toàn từ AI
 function cleanAndParseJSON(text) {
   if (!text) throw new Error("Phản hồi từ AI rỗng");
-  // Loại bỏ các ký tự bọc markdown nếu có
   let cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
   
   try {
     return JSON.parse(cleaned);
   } catch (e) {
-    // Nếu vẫn lỗi, thử tìm mảng [...] bằng Regex
     const match = cleaned.match(/\[[\s\S]*\]/);
     if (match) {
       return JSON.parse(match[0]);
@@ -97,7 +95,7 @@ async function initDB() {
   try {
     const wasmPath = path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
     const SQL = await initSqlJs({
-      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `[https://sql.js.org/dist/$](https://sql.js.org/dist/$){file}`
+      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `https://sql.js.org/dist/${file}`
     });
 
     db = fs.existsSync(dbPath) ? new SQL.Database(fs.readFileSync(dbPath)) : new SQL.Database();
@@ -271,25 +269,13 @@ Cấu trúc JSON bắt buộc:
       if (!process.env.GEMINI_API_KEY) {
         console.error("❌ CẢNH BÁO: Chưa cấu hình GEMINI_API_KEY trong Environment Variables!");
       } else {
-        let aiResponseText = "";
-        
-        // Thử gọi model chính gemini-2.5-flash, nếu lỗi tự động fallback sang gemini-1.5-flash
-        try {
-          const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-          });
-          aiResponseText = response.text;
-        } catch (modelErr) {
-          console.warn("⚠️ Fallback sang gemini-1.5-flash do lỗi:", modelErr.message);
-          const fallbackResponse = await ai.models.generateContent({
-            model: 'gemini-1.5-flash',
-            contents: prompt,
-          });
-          aiResponseText = fallbackResponse.text;
-        }
+        // Tên model chuẩn tuyệt đối cho SDK @google/genai
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
 
-        const quizList = cleanAndParseJSON(aiResponseText);
+        const quizList = cleanAndParseJSON(response.text);
 
         if (Array.isArray(quizList)) {
           quizList.forEach(q => {
