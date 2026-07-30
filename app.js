@@ -78,10 +78,8 @@ function parseResult(res) {
 // Hàm hỗ trợ bóc tách JSON an toàn từ kết quả trả về của AI
 function cleanAndParseJSON(text) {
   try {
-    // Thử parse trực tiếp
     return JSON.parse(text);
   } catch (e) {
-    // Nếu thất bại, tìm đoạn chuỗi nằm trong [...]
     const match = text.match(/\[[\s\S]*\]/);
     if (match) {
       return JSON.parse(match[0]);
@@ -94,7 +92,7 @@ async function initDB() {
   try {
     const wasmPath = path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
     const SQL = await initSqlJs({
-      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `[https://sql.js.org/dist/$](https://sql.js.org/dist/$){file}`
+      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `https://sql.js.org/dist/${file}`
     });
 
     db = fs.existsSync(dbPath) ? new SQL.Database(fs.readFileSync(dbPath)) : new SQL.Database();
@@ -210,7 +208,7 @@ app.get('/api/lessons', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql, params)));
 });
 
-// API Thêm Bài học mới + Tự tạo bài tập bằng AI (Đã sửa & Nâng cấp)
+// API Thêm Bài học mới + Tự tạo bài tập bằng AI
 app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async (req, res) => {
   const { code, title, level, grade_class, topic, description, auto_gen_quiz } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
@@ -234,11 +232,10 @@ app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async
           const pdfData = await pdfParse(dataBuffer);
           contextText = (pdfData.text || "").trim().slice(0, 3500);
         } catch (pdfErr) {
-          console.warn("⚠️ Không thể trích xuất văn bản từ PDF, chuyển sang mode dùng Tiêu đề & Chuyên đề:", pdfErr.message);
+          console.warn("⚠️ Không thể trích xuất văn bản từ PDF, chuyển sang chế độ tên bài học:", pdfErr.message);
         }
       }
 
-      // Xây dựng Prompt linh hoạt: Nếu PDF dạng ảnh hoặc rỗng, dựa vào Tiêu đề + Chuyên đề
       let promptContent = "";
       if (contextText.length > 50) {
         promptContent = `Dựa vào nội dung tài liệu Toán học sau đây:\n---\n${contextText}\n---`;
@@ -269,6 +266,7 @@ Cấu trúc JSON chính xác từng trường:
       if (!process.env.GEMINI_API_KEY) {
         console.error("❌ CẢNH BÁO: Chưa cấu hình GEMINI_API_KEY trong Environment Variables!");
       } else {
+        // Đã cập nhật Model Gemini chuẩn đang hoạt động
         const response = await ai.models.generateContent({
           model: 'gemini-2.5-flash',
           contents: prompt,
