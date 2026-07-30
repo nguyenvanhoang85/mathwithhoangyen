@@ -1,18 +1,16 @@
 {
   "name": "math-hoangyen",
   "version": "1.0.0",
-  "description": "Hệ thống quản lý tài liệu và bài tập toán",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
-    "@google/genai": "^0.1.1",
-    "express": "^4.18.2",
-    "express-session": "^1.17.3",
-    "json2csv": "^6.0.0-alpha.5",
+    "@google/generative-ai": "^0.21.0",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1",
-    "sql.js": "^1.8.0"
+    "sql.js": "^1.11.0"
   }
 }
