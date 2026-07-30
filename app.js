@@ -4,16 +4,16 @@ const multer = require('multer');
 const session = require('express-session');
 const path = require('path');
 const fs = require('fs');
-const pdfParse = require('pdf-parse'); // Thư viện đọc text từ PDF
-const { GoogleGenAI } = require('@google/genai'); // Google GenAI SDK chính thức
+const pdfParse = require('pdf-parse'); // Thư viện đọc nội dung PDF
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Thư viện Gemini AI chuẩn
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Khởi tạo Gemini AI Client (Sử dụng API Key từ hằng số môi trường)
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+// Khởi tạo Gemini AI Client với API Key từ Environment Variable
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// Cấu hình thư mục upload (Tương thích bộ nhớ tạm /tmp trên Render)
+// Cấu hình thư mục lưu trữ file upload (Tương thích bộ nhớ tạm /tmp của Render)
 const uploadDir = process.env.RENDER ? path.join('/tmp', 'uploads') : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -37,7 +37,7 @@ app.use(session({
   secret: 'math-hoangyen-hierarchy-2026',
   resave: false,
   saveUninitialized: true,
-  cookie: { maxAge: 8 * 3600000 }
+  cookie: { maxAge: 8 * 3600000 } // Session kéo dài 8 tiếng
 }));
 
 function requireLogin(req, res, next) {
@@ -47,7 +47,7 @@ function requireLogin(req, res, next) {
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.user && req.session.user.role === 'Admin') return next();
-  res.status(403).send('Từ chối truy cập: Quyền Hạn Bắt Buộc là Admin/Giáo viên!');
+  res.status(403).send('Từ chối truy cập: Yêu cầu quyền Admin!');
 }
 
 let db;
@@ -194,7 +194,7 @@ app.get('/api/lessons', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql, params)));
 });
 
-// API Thêm Bài học mới + Tự tạo bài tập bằng AI
+// API Thêm Bài học mới + Tự động phân tích PDF sinh câu hỏi trắc nghiệm bằng AI
 app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async (req, res) => {
   const { code, title, level, grade_class, topic, description, auto_gen_quiz } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
@@ -203,27 +203,24 @@ app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async
     db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description, pdf_path) VALUES (?, ?, ?, ?, ?, ?, ?)', 
       [code, title, level, grade_class, topic, description || '', pdfPath]);
     
-    // Lấy ID bài học vừa lưu
     const lastIdRes = db.exec('SELECT last_insert_rowid() as id');
     const lessonId = lastIdRes[0].values[0][0];
 
-    // NẾU TÍCH CHỌN TỰ ĐỘNG TẠO BÀI TẬP VÀ CÓ FILE PDF
+    // XỬ LÝ TỰ ĐỘNG TẠO BÀI TẬP VỚI GEMINI AI
     if (auto_gen_quiz === 'on' && req.file) {
       const fullPath = path.join(uploadDir, req.file.filename);
       const dataBuffer = fs.readFileSync(fullPath);
       
-      // 1. Đọc nội dung văn bản từ PDF
       const pdfData = await pdfParse(dataBuffer);
-      const textContent = pdfData.text.slice(0, 4000); // Giới hạn ký tự tối ưu hóa tốc độ AI
+      const textContent = pdfData.text.slice(0, 4000); // Lấy 4000 ký tự đầu để tối ưu hóa
 
       if (textContent.trim().length > 50) {
-        // 2. Tạo prompt yêu cầu Gemini sinh trắc nghiệm
         const prompt = `Bạn là chuyên gia soạn đề thi Toán học Việt Nam. Dựa vào nội dung tài liệu toán sau đây:
 ---
 ${textContent}
 ---
 Hãy tạo 3 câu hỏi trắc nghiệm khách quan phù hợp cho trình độ ${grade_class}. 
-Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm văn bản giải thích ngoài JSON, theo cấu trúc chính xác sau:
+Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm bất cứ văn bản hay ký tự nào ngoài JSON, theo cấu trúc chính xác sau:
 [
   {
     "question": "Nội dung câu hỏi?",
@@ -236,16 +233,13 @@ Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm
   }
 ]`;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const result = await model.generateContent(prompt);
+        const responseText = await result.response.text();
 
-        // Xử lý chuỗi JSON kết quả trả về từ Gemini
-        const rawText = response.text.replace(/```json|```/g, '').trim();
+        const rawText = responseText.replace(/```json|```/g, '').trim();
         const quizList = JSON.parse(rawText);
 
-        // 3. Lưu các câu hỏi trắc nghiệm tự động vào Database
         quizList.forEach(q => {
           db.run(`
             INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation)
@@ -259,7 +253,7 @@ Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm
     res.redirect('/#lessons');
   } catch (err) {
     console.error('Lỗi thêm bài học hoặc lỗi sinh câu hỏi AI:', err);
-    res.status(500).send('Lỗi trong quá trình xử lý! <a href="/">Quay lại trang chủ</a>');
+    res.status(500).send('Có lỗi xảy ra trong quá trình xử lý! <a href="/">Quay lại trang chủ</a>');
   }
 });
 
@@ -271,7 +265,7 @@ app.delete('/api/lessons/:id', requireLogin, requireAdmin, (req, res) => {
   res.json({ success: true });
 });
 
-// API Lấy danh sách bài tập trắc nghiệm
+// API Lấy danh sách câu hỏi trắc nghiệm
 app.get('/api/quizzes', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   const lesson_id = req.query.lesson_id;
@@ -302,7 +296,7 @@ app.post('/api/submit-quiz', requireLogin, (req, res) => {
   res.json({ score, status, correctCount, total: quizzes.length });
 });
 
-// API Lấy kết quả làm bài
+// API Lấy bảng điểm
 app.get('/api/results', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   let sql = `
@@ -317,7 +311,7 @@ app.get('/api/results', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql)));
 });
 
-// Giao diện chính
+// Trang quản trị chính
 app.get('/', requireLogin, (req, res) => {
   const user = req.session.user;
   res.send(`
@@ -604,6 +598,6 @@ app.get('/', requireLogin, (req, res) => {
 
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Goodbye: Server Math HoangYen đang chạy thành công tại cổng: ${PORT}`);
+    console.log(`Server Math HoangYen đang chạy thành công tại cổng: ${PORT}`);
   });
 });
