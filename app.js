@@ -4,16 +4,17 @@ const multer = require('multer');
 const session = require('express-session');
 const path = require('path');
 const fs = require('fs');
-const pdfParse = require('pdf-parse'); // Thư viện đọc nội dung PDF
-const { GoogleGenerativeAI } = require('@google/generative-ai'); // Thư viện Gemini AI chuẩn
+const pdfParse = require('pdf-parse');
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Khởi tạo Gemini AI Client với API Key từ Environment Variable
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+// Khởi tạo Gemini AI Client
+const apiKey = process.env.GEMINI_API_KEY || '';
+const ai = new GoogleGenAI({ apiKey: apiKey });
 
-// Cấu hình thư mục lưu trữ file upload (Tương thích bộ nhớ tạm /tmp của Render)
+// Cấu hình thư mục upload (Tương thích bộ nhớ tạm /tmp trên Render)
 const uploadDir = process.env.RENDER ? path.join('/tmp', 'uploads') : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -37,7 +38,7 @@ app.use(session({
   secret: 'math-hoangyen-hierarchy-2026',
   resave: false,
   saveUninitialized: true,
-  cookie: { maxAge: 8 * 3600000 } // Session kéo dài 8 tiếng
+  cookie: { maxAge: 8 * 3600000 }
 }));
 
 function requireLogin(req, res, next) {
@@ -47,7 +48,7 @@ function requireLogin(req, res, next) {
 
 function requireAdmin(req, res, next) {
   if (req.session && req.session.user && req.session.user.role === 'Admin') return next();
-  res.status(403).send('Từ chối truy cập: Yêu cầu quyền Admin!');
+  res.status(403).send('Từ chối truy cập: Quyền Hạn Bắt Buộc là Admin/Giáo viên!');
 }
 
 let db;
@@ -74,11 +75,26 @@ function parseResult(res) {
   });
 }
 
+// Hàm hỗ trợ bóc tách JSON an toàn từ kết quả trả về của AI
+function cleanAndParseJSON(text) {
+  try {
+    // Thử parse trực tiếp
+    return JSON.parse(text);
+  } catch (e) {
+    // Nếu thất bại, tìm đoạn chuỗi nằm trong [...]
+    const match = text.match(/\[[\s\S]*\]/);
+    if (match) {
+      return JSON.parse(match[0]);
+    }
+    throw new Error("Không tìm thấy dữ liệu JSON hợp lệ trong phản hồi từ Gemini AI.");
+  }
+}
+
 async function initDB() {
   try {
     const wasmPath = path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
     const SQL = await initSqlJs({
-      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `https://sql.js.org/dist/${file}`
+      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `[https://sql.js.org/dist/$](https://sql.js.org/dist/$){file}`
     });
 
     db = fs.existsSync(dbPath) ? new SQL.Database(fs.readFileSync(dbPath)) : new SQL.Database();
@@ -194,10 +210,11 @@ app.get('/api/lessons', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql, params)));
 });
 
-// API Thêm Bài học mới + Tự động phân tích PDF sinh câu hỏi trắc nghiệm bằng AI
+// API Thêm Bài học mới + Tự tạo bài tập bằng AI (Đã sửa & Nâng cấp)
 app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async (req, res) => {
   const { code, title, level, grade_class, topic, description, auto_gen_quiz } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
+  let quizCountAdded = 0;
   
   try {
     db.run('INSERT INTO math_lessons (code, title, level, grade_class, topic, description, pdf_path) VALUES (?, ?, ?, ?, ?, ?, ?)', 
@@ -206,54 +223,85 @@ app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async
     const lastIdRes = db.exec('SELECT last_insert_rowid() as id');
     const lessonId = lastIdRes[0].values[0][0];
 
-    // XỬ LÝ TỰ ĐỘNG TẠO BÀI TẬP VỚI GEMINI AI
-    if (auto_gen_quiz === 'on' && req.file) {
-      const fullPath = path.join(uploadDir, req.file.filename);
-      const dataBuffer = fs.readFileSync(fullPath);
-      
-      const pdfData = await pdfParse(dataBuffer);
-      const textContent = pdfData.text.slice(0, 4000); // Lấy 4000 ký tự đầu để tối ưu hóa
+    // XỬ LÝ SINH BÀI TẬP BẰNG AI
+    if (auto_gen_quiz === 'on') {
+      let contextText = "";
 
-      if (textContent.trim().length > 50) {
-        const prompt = `Bạn là chuyên gia soạn đề thi Toán học Việt Nam. Dựa vào nội dung tài liệu toán sau đây:
----
-${textContent}
----
-Hãy tạo 3 câu hỏi trắc nghiệm khách quan phù hợp cho trình độ ${grade_class}. 
-Trả về dữ liệu dưới dạng JSON Array duy nhất, KHÔNG chứa thêm bất cứ văn bản hay ký tự nào ngoài JSON, theo cấu trúc chính xác sau:
+      if (req.file) {
+        try {
+          const fullPath = path.join(uploadDir, req.file.filename);
+          const dataBuffer = fs.readFileSync(fullPath);
+          const pdfData = await pdfParse(dataBuffer);
+          contextText = (pdfData.text || "").trim().slice(0, 3500);
+        } catch (pdfErr) {
+          console.warn("⚠️ Không thể trích xuất văn bản từ PDF, chuyển sang mode dùng Tiêu đề & Chuyên đề:", pdfErr.message);
+        }
+      }
+
+      // Xây dựng Prompt linh hoạt: Nếu PDF dạng ảnh hoặc rỗng, dựa vào Tiêu đề + Chuyên đề
+      let promptContent = "";
+      if (contextText.length > 50) {
+        promptContent = `Dựa vào nội dung tài liệu Toán học sau đây:\n---\n${contextText}\n---`;
+      } else {
+        promptContent = `Tạo bài tập Toán học chuẩn chương trình cho chủ đề: "${title}" (Chuyên đề: ${topic || 'Đại số/Hình học'}).`;
+      }
+
+      const prompt = `${promptContent}
+
+Hãy tạo 4 câu hỏi trắc nghiệm khách quan toán học phù hợp cho học sinh trình độ ${grade_class}.
+
+YÊU CẦU ĐỊNH DẠNG:
+Trả về duy nhất một mảng JSON (JSON Array), KHÔNG chứa ký tự mở đầu hay kết thúc bằng Markdown (không dùng \`\`\`json), KHÔNG chứa bất kỳ lời giải thích nào ngoài JSON.
+
+Cấu trúc JSON chính xác từng trường:
 [
   {
-    "question": "Nội dung câu hỏi?",
-    "option_a": "Lựa chọn A",
-    "option_b": "Lựa chọn B",
-    "option_c": "Lựa chọn C",
-    "option_d": "Lựa chọn D",
+    "question": "Nội dung câu hỏi Toán?",
+    "option_a": "Phương án A",
+    "option_b": "Phương án B",
+    "option_c": "Phương án C",
+    "option_d": "Phương án D",
     "correct_option": "A",
-    "explanation": "Giải thích chi tiết ngắn gọn"
+    "explanation": "Lời giải chi tiết ngắn gọn"
   }
 ]`;
 
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const result = await model.generateContent(prompt);
-        const responseText = await result.response.text();
-
-        const rawText = responseText.replace(/```json|```/g, '').trim();
-        const quizList = JSON.parse(rawText);
-
-        quizList.forEach(q => {
-          db.run(`
-            INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `, [lessonId, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, q.explanation || '']);
+      if (!process.env.GEMINI_API_KEY) {
+        console.error("❌ CẢNH BÁO: Chưa cấu hình GEMINI_API_KEY trong Environment Variables!");
+      } else {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
         });
+
+        const quizList = cleanAndParseJSON(response.text);
+
+        if (Array.isArray(quizList)) {
+          quizList.forEach(q => {
+            db.run(`
+              INSERT INTO math_quizzes (lesson_id, question, option_a, option_b, option_c, option_d, correct_option, explanation)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `, [lessonId, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option || 'A', q.explanation || '']);
+            quizCountAdded++;
+          });
+        }
       }
     }
 
     saveDatabase();
-    res.redirect('/#lessons');
+    res.send(`
+      <script>
+        alert("✅ Thêm bài học thành công! AI đã tạo ${quizCountAdded} câu hỏi trắc nghiệm.");
+        window.location.href = "/#lessons";
+      </script>
+    `);
   } catch (err) {
-    console.error('Lỗi thêm bài học hoặc lỗi sinh câu hỏi AI:', err);
-    res.status(500).send('Có lỗi xảy ra trong quá trình xử lý! <a href="/">Quay lại trang chủ</a>');
+    console.error('❌ Lỗi xử lý bài học/AI:', err);
+    res.status(500).send(`
+      <h3>Lỗi trong quá trình tạo bài học/bài tập!</h3>
+      <p>Chi tiết: ${err.message}</p>
+      <a href="/">Quay lại trang chủ</a>
+    `);
   }
 });
 
@@ -265,7 +313,7 @@ app.delete('/api/lessons/:id', requireLogin, requireAdmin, (req, res) => {
   res.json({ success: true });
 });
 
-// API Lấy danh sách câu hỏi trắc nghiệm
+// API Lấy danh sách bài tập trắc nghiệm
 app.get('/api/quizzes', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   const lesson_id = req.query.lesson_id;
@@ -296,7 +344,7 @@ app.post('/api/submit-quiz', requireLogin, (req, res) => {
   res.json({ score, status, correctCount, total: quizzes.length });
 });
 
-// API Lấy bảng điểm
+// API Lấy kết quả làm bài
 app.get('/api/results', requireLogin, (req, res) => {
   if (!db) return res.json([]);
   let sql = `
@@ -311,7 +359,7 @@ app.get('/api/results', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql)));
 });
 
-// Trang quản trị chính
+// Giao diện chính
 app.get('/', requireLogin, (req, res) => {
   const user = req.session.user;
   res.send(`
@@ -391,7 +439,7 @@ app.get('/', requireLogin, (req, res) => {
                 <div class="ai-box">
                   <label style="font-weight:bold; color:#15803d; cursor:pointer;">
                     <input type="checkbox" name="auto_gen_quiz" value="on" checked style="width:auto; margin-right:5px;">
-                    ✨ Tự động phân tích PDF & sinh câu hỏi trắc nghiệm!
+                    ✨ Tự động phân tích & sinh bài tập AI
                   </label>
                 </div>
 
@@ -539,12 +587,12 @@ app.get('/', requireLogin, (req, res) => {
           form.innerHTML = '';
           quizzes.forEach((q, idx) => {
             form.innerHTML += \`
-              <div style="margin-bottom: 15px; padding:10px; background:#f8fafc; border-radius:6px;">
+              <div style="margin-bottom: 15px; padding:12px; background:#f8fafc; border-radius:6px; border:1px solid #e2e8f0;">
                 <p><b>Câu \${idx + 1}: \${q.question}</b></p>
-                <label><input type="radio" name="q_\${q.id}" value="A"> A. \${q.option_a}</label><br>
-                <label><input type="radio" name="q_\${q.id}" value="B"> B. \${q.option_b}</label><br>
-                <label><input type="radio" name="q_\${q.id}" value="C"> C. \${q.option_c}</label><br>
-                <label><input type="radio" name="q_\${q.id}" value="D"> D. \${q.option_d}</label>
+                <label style="display:block; margin:4px 0;"><input type="radio" name="q_\${q.id}" value="A"> A. \${q.option_a}</label>
+                <label style="display:block; margin:4px 0;"><input type="radio" name="q_\${q.id}" value="B"> B. \${q.option_b}</label>
+                <label style="display:block; margin:4px 0;"><input type="radio" name="q_\${q.id}" value="C"> C. \${q.option_c}</label>
+                <label style="display:block; margin:4px 0;"><input type="radio" name="q_\${q.id}" value="D"> D. \${q.option_d}</label>
               </div>
             \`;
           });
@@ -598,6 +646,6 @@ app.get('/', requireLogin, (req, res) => {
 
 initDB().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server Math HoangYen đang chạy thành công tại cổng: ${PORT}`);
+    console.log(`🚀 Server Math HoangYen đang chạy thành công tại cổng: ${PORT}`);
   });
 });
