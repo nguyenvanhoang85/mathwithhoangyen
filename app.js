@@ -75,16 +75,21 @@ function parseResult(res) {
   });
 }
 
-// Hàm hỗ trợ bóc tách JSON an toàn từ kết quả trả về của AI
+// Hàm xử lý và bóc tách dữ liệu JSON an toàn từ AI
 function cleanAndParseJSON(text) {
+  if (!text) throw new Error("Phản hồi từ AI rỗng");
+  // Loại bỏ các ký tự bọc markdown nếu có
+  let cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+  
   try {
-    return JSON.parse(text);
+    return JSON.parse(cleaned);
   } catch (e) {
-    const match = text.match(/\[[\s\S]*\]/);
+    // Nếu vẫn lỗi, thử tìm mảng [...] bằng Regex
+    const match = cleaned.match(/\[[\s\S]*\]/);
     if (match) {
       return JSON.parse(match[0]);
     }
-    throw new Error("Không tìm thấy dữ liệu JSON hợp lệ trong phản hồi từ Gemini AI.");
+    throw new Error("Không thể chuyển đổi phản hồi từ Gemini AI thành định dạng JSON bài tập hợp lệ.");
   }
 }
 
@@ -92,7 +97,7 @@ async function initDB() {
   try {
     const wasmPath = path.join(__dirname, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
     const SQL = await initSqlJs({
-      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `https://sql.js.org/dist/${file}`
+      locateFile: file => fs.existsSync(wasmPath) ? wasmPath : `[https://sql.js.org/dist/$](https://sql.js.org/dist/$){file}`
     });
 
     db = fs.existsSync(dbPath) ? new SQL.Database(fs.readFileSync(dbPath)) : new SQL.Database();
@@ -208,7 +213,7 @@ app.get('/api/lessons', requireLogin, (req, res) => {
   res.json(parseResult(db.exec(sql, params)));
 });
 
-// API Thêm Bài học mới + Tự tạo bài tập bằng AI
+// API Thêm Bài học mới + Tự động sinh bài tập bằng Gemini AI
 app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async (req, res) => {
   const { code, title, level, grade_class, topic, description, auto_gen_quiz } = req.body;
   const pdfPath = req.file ? `/uploads/${req.file.filename}` : null;
@@ -232,7 +237,7 @@ app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async
           const pdfData = await pdfParse(dataBuffer);
           contextText = (pdfData.text || "").trim().slice(0, 3500);
         } catch (pdfErr) {
-          console.warn("⚠️ Không thể trích xuất văn bản từ PDF, chuyển sang chế độ tên bài học:", pdfErr.message);
+          console.warn("⚠️ Không thể đọc file PDF, chuyển sang chế độ tạo theo tiêu đề bài học:", pdfErr.message);
         }
       }
 
@@ -248,9 +253,9 @@ app.post('/api/lessons', requireLogin, requireAdmin, upload.single('pdf'), async
 Hãy tạo 4 câu hỏi trắc nghiệm khách quan toán học phù hợp cho học sinh trình độ ${grade_class}.
 
 YÊU CẦU ĐỊNH DẠNG:
-Trả về duy nhất một mảng JSON (JSON Array), KHÔNG chứa ký tự mở đầu hay kết thúc bằng Markdown (không dùng \`\`\`json), KHÔNG chứa bất kỳ lời giải thích nào ngoài JSON.
+Trả về duy nhất một mảng JSON (JSON Array), KHÔNG chứa ký tự bọc Markdown (không dùng \`\`\`json), KHÔNG chứa bất kỳ lời giải thích nào khác ngoài JSON.
 
-Cấu trúc JSON chính xác từng trường:
+Cấu trúc JSON bắt buộc:
 [
   {
     "question": "Nội dung câu hỏi Toán?",
@@ -266,13 +271,25 @@ Cấu trúc JSON chính xác từng trường:
       if (!process.env.GEMINI_API_KEY) {
         console.error("❌ CẢNH BÁO: Chưa cấu hình GEMINI_API_KEY trong Environment Variables!");
       } else {
-        // Đã cập nhật Model Gemini chuẩn đang hoạt động
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
+        let aiResponseText = "";
+        
+        // Thử gọi model chính gemini-2.5-flash, nếu lỗi tự động fallback sang gemini-1.5-flash
+        try {
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+          });
+          aiResponseText = response.text;
+        } catch (modelErr) {
+          console.warn("⚠️ Fallback sang gemini-1.5-flash do lỗi:", modelErr.message);
+          const fallbackResponse = await ai.models.generateContent({
+            model: 'gemini-1.5-flash',
+            contents: prompt,
+          });
+          aiResponseText = fallbackResponse.text;
+        }
 
-        const quizList = cleanAndParseJSON(response.text);
+        const quizList = cleanAndParseJSON(aiResponseText);
 
         if (Array.isArray(quizList)) {
           quizList.forEach(q => {
@@ -296,9 +313,11 @@ Cấu trúc JSON chính xác từng trường:
   } catch (err) {
     console.error('❌ Lỗi xử lý bài học/AI:', err);
     res.status(500).send(`
-      <h3>Lỗi trong quá trình tạo bài học/bài tập!</h3>
-      <p>Chi tiết: ${err.message}</p>
-      <a href="/">Quay lại trang chủ</a>
+      <div style="font-family:sans-serif; padding:20px; text-align:center;">
+        <h3 style="color:#dc2626;">❌ Lỗi trong quá trình tạo bài học/bài tập!</h3>
+        <p>Chi tiết: ${err.message}</p>
+        <a href="/" style="color:#0284c7; font-weight:bold;">Quay lại trang chủ</a>
+      </div>
     `);
   }
 });
